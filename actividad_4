@@ -1,0 +1,842 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "time.h"
+
+// ======================================================
+// WIFI
+// ======================================================
+
+const char* ssid = " ";
+const char* password = "Hola12345";
+
+// ======================================================
+// MQTT
+// ======================================================
+
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+
+const char* nombreEquipo = "JIEDMAI";
+
+const char* topicTX = "JIEDMAI_TX";
+const char* topicRX = "JIEDMAI_RX";
+
+// ======================================================
+// WIFI + MQTT
+// ======================================================
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ======================================================
+// AT-09
+// AT-09 TXD -> GPIO 16
+// AT-09 RXD -> GPIO 17
+// ======================================================
+
+#define RX 16
+#define TX 17
+
+HardwareSerial BluetoothSerial(2);
+
+// ======================================================
+// LEDS
+// ======================================================
+
+#define LED_VIOLETA 23 //azul
+#define LED_VERDE 18
+#define LED_AMARILLO 19
+#define LED_NARANJA 4 //rojo
+
+#define LED_ROJO 25
+#define LED_AZUL 26 //naranja 
+#define LED_BLANCO 27
+
+// ======================================================
+// VARIABLES DE ESTADO
+// ======================================================
+
+// WiFi
+bool wifiConectado = false;
+
+// Bluetooth
+bool bluetoothConectado = false;
+
+// Temporizadores
+unsigned long ultimoIntentoBluetooth = 0;
+unsigned long ultimoParpadeoBluetooth = 0;
+unsigned long ultimoParpadeoWiFi = 0;
+
+bool estadoParpadeoBluetooth = false;
+bool estadoParpadeoWiFi = false;
+
+// Tiempo para considerar Bluetooth activo
+unsigned long ultimaActividadBluetooth = 0;
+
+const unsigned long TIEMPO_BLUETOOTH_ACTIVO = 10000;
+
+// ======================================================
+// APAGAR LEDS DE ESTADO
+// ======================================================
+
+void apagarLEDsEstado() {
+
+  digitalWrite(LED_ROJO, LOW);
+  digitalWrite(LED_AZUL, LOW);
+  digitalWrite(LED_BLANCO, LOW);
+}
+
+// ======================================================
+// INDICADORES DE EVENTOS
+// ======================================================
+
+void ledVerde() {
+
+  digitalWrite(LED_VERDE, HIGH);
+
+  // Se utiliza delay únicamente para el indicador
+  delay(1000);
+
+  digitalWrite(LED_VERDE, LOW);
+}
+
+void ledAmarillo() {
+
+  digitalWrite(LED_AMARILLO, HIGH);
+
+  delay(1000);
+
+  digitalWrite(LED_AMARILLO, LOW);
+}
+
+void ledNaranja() {
+
+  digitalWrite(LED_NARANJA, HIGH);
+
+  delay(1000);
+
+  digitalWrite(LED_NARANJA, LOW);
+}
+
+// ======================================================
+// OBTENER FECHA Y HORA
+// ======================================================
+
+void obtenerFechaHora(String &fecha, String &hora) {
+
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo)) {
+
+    fecha = "00-00-0000";
+    hora = "00:00:00";
+
+    return;
+  }
+
+  char fechaBuf[11];
+  char horaBuf[9];
+
+  strftime(
+    fechaBuf,
+    sizeof(fechaBuf),
+    "%d-%m-%Y",
+    &timeinfo
+  );
+
+  strftime(
+    horaBuf,
+    sizeof(horaBuf),
+    "%H:%M:%S",
+    &timeinfo
+  );
+
+  fecha = String(fechaBuf);
+  hora = String(horaBuf);
+}
+
+// ======================================================
+// CREAR JSON
+// ======================================================
+
+String crearJSON(String origen, String accion) {
+
+  String fecha;
+  String hora;
+
+  obtenerFechaHora(fecha, hora);
+
+  JsonDocument doc;
+
+  doc["id"] = JIEDMAI;
+  doc["origen"] = origen;
+  doc["accion"] = accion;
+  doc["fecha"] = fecha;
+  doc["hora"] = hora;
+
+  String json;
+
+  serializeJsonPretty(doc, json);
+
+  return json;
+}
+
+// ======================================================
+// PUBLICAR MQTT
+// ======================================================
+
+void publicarMQTT(String json) {
+
+  if (!client.connected()) {
+
+    Serial.println("MQTT no conectado.");
+
+    return;
+  }
+
+  if (client.publish(topicTX, json.c_str())) {
+
+    Serial.println();
+    Serial.println("========== MQTT PUBLICADO ==========");
+    Serial.print("Topic: ");
+    Serial.println(topicTX);
+
+    Serial.println("Mensaje:");
+    Serial.println(json);
+
+    Serial.println("====================================");
+
+    // LED VERDE
+    ledVerde();
+
+  } else {
+
+    Serial.println("ERROR AL PUBLICAR MQTT");
+  }
+}
+
+// ======================================================
+// CONECTAR WIFI
+// ======================================================
+
+void conectarWiFi() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("          CONEXION WIFI");
+  Serial.println("================================");
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Conectando");
+
+  unsigned long inicio = millis();
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    // Parpadeo blanco cada 500 ms
+    if (millis() - ultimoParpadeoWiFi >= 500) {
+
+      ultimoParpadeoWiFi = millis();
+
+      estadoParpadeoWiFi = !estadoParpadeoWiFi;
+
+      digitalWrite(
+        LED_BLANCO,
+        estadoParpadeoWiFi
+      );
+    }
+
+    delay(10);
+
+    Serial.print(".");
+
+    // Evitar bloqueo infinito
+    if (millis() - inicio > 20000) {
+
+      Serial.println();
+      Serial.println("No se pudo conectar al WiFi.");
+
+      digitalWrite(LED_BLANCO, LOW);
+
+      return;
+    }
+  }
+
+  Serial.println();
+
+  Serial.println("WiFi conectado correctamente");
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Blanco fijo
+  digitalWrite(LED_BLANCO, HIGH);
+
+  wifiConectado = true;
+}
+
+// ======================================================
+// CONECTAR MQTT
+// ======================================================
+
+void conectarMQTT() {
+
+  while (!client.connected()) {
+
+    Serial.print("Conectando al broker MQTT...");
+
+    String clientID =
+      "ESP32-JIEDMAI-" +
+      String(random(0xffff), HEX);
+
+    if (client.connect(clientID.c_str())) {
+
+      Serial.println(" conectado");
+
+      if (client.subscribe(topicRX)) {
+
+        Serial.print("Suscrito a: ");
+        Serial.println(topicRX);
+
+      } else {
+
+        Serial.println("ERROR al suscribirse");
+      }
+
+    } else {
+
+      Serial.print(" ERROR. Estado: ");
+      Serial.println(client.state());
+
+      delay(2000);
+    }
+  }
+}
+
+// ======================================================
+// MQTT CALLBACK
+// ======================================================
+
+void callback(
+  char* topic,
+  byte* payload,
+  unsigned int length
+) {
+
+  Serial.println();
+  Serial.println("========== MQTT RECIBIDO ==========");
+
+  Serial.print("Topic: ");
+  Serial.println(topic);
+
+  String mensaje = "";
+
+  for (unsigned int i = 0; i < length; i++) {
+
+    mensaje += (char)payload[i];
+  }
+
+  Serial.println("Mensaje:");
+  Serial.println(mensaje);
+
+  // ====================================================
+  // DESERIALIZAR
+  // ====================================================
+
+  JsonDocument doc;
+
+  DeserializationError error =
+    deserializeJson(doc, mensaje);
+
+  if (error) {
+
+    Serial.print("ERROR JSON: ");
+    Serial.println(error.c_str());
+
+    return;
+  }
+
+  const char* idRecibido = doc["id"];
+  const char* accion = doc["accion"];
+
+  // ====================================================
+  // VALIDAR ID
+  // ====================================================
+
+  if (idRecibido == nullptr) {
+
+    Serial.println("JSON SIN ID");
+
+    ledNaranja();
+
+    return;
+  }
+
+  Serial.print("ID recibido: ");
+  Serial.println(idRecibido);
+
+  Serial.print("ID esperado: ");
+  Serial.println(nombreEquipo);
+
+  // ====================================================
+  // ID VALIDO
+  // ====================================================
+
+  if (strcmp(idRecibido, nombreEquipo) == 0) {
+
+    Serial.println("ID VALIDO");
+
+    // Amarillo
+    ledAmarillo();
+
+    // ==================================================
+    // CONTROL LED VIOLETA
+    // ==================================================
+
+    if (accion != nullptr) {
+
+      if (strcmp(accion, "ON") == 0) {
+
+        digitalWrite(
+          LED_VIOLETA,
+          HIGH
+        );
+
+        Serial.println(
+          "LED VIOLETA: ENCENDIDO"
+        );
+      }
+
+      else if (strcmp(accion, "OFF") == 0) {
+
+        digitalWrite(
+          LED_VIOLETA,
+          LOW
+        );
+
+        Serial.println(
+          "LED VIOLETA: APAGADO"
+        );
+      }
+
+      else {
+
+        Serial.println(
+          "ACCION NO RECONOCIDA"
+        );
+      }
+    }
+
+    // ==================================================
+    // ENVIAR AL AT-09
+    // ==================================================
+
+    BluetoothSerial.println(mensaje);
+
+    Serial.println(
+      "JSON enviado al AT-09"
+    );
+  }
+
+  // ====================================================
+  // ID INVALIDO
+  // ====================================================
+
+  else {
+
+    Serial.println("ID INVALIDO");
+
+    Serial.println(
+      "Mensaje ignorado."
+    );
+
+    ledNaranja();
+  }
+
+  Serial.println("====================================");
+}
+
+// ======================================================
+// REVISAR BLUETOOTH
+// ======================================================
+
+void revisarBluetooth() {
+
+  // ====================================================
+  // MENSAJE RECIBIDO
+  // ====================================================
+
+  if (BluetoothSerial.available()) {
+
+    String mensajeBluetooth =
+      BluetoothSerial.readStringUntil('\n');
+
+    mensajeBluetooth.trim();
+
+    if (mensajeBluetooth.length() == 0) {
+
+      return;
+    }
+
+    // Registrar actividad Bluetooth
+    ultimaActividadBluetooth = millis();
+
+    bluetoothConectado = true;
+
+    Serial.println();
+    Serial.println(
+      "========== AT-09 RECIBIDO =========="
+    );
+
+    Serial.print("Mensaje: [");
+    Serial.print(mensajeBluetooth);
+    Serial.println("]");
+
+    // ==================================================
+    // DESERIALIZAR
+    // ==================================================
+
+    JsonDocument doc;
+
+    DeserializationError error =
+      deserializeJson(
+        doc,
+        mensajeBluetooth
+      );
+
+    if (error) {
+
+      Serial.println(
+        "El mensaje no es JSON valido."
+      );
+
+      Serial.println(
+        "No se publicara."
+      );
+
+      Serial.println(
+        "===================================="
+      );
+
+      return;
+    }
+
+    // ==================================================
+    // CREAR JSON FINAL
+    // ==================================================
+
+    doc["id"] = nombreEquipo;
+
+    doc["origen"] = "Smartphone";
+
+    if (!doc["accion"]) {
+
+      doc["accion"] = "OFF";
+    }
+
+    String fecha;
+    String hora;
+
+    obtenerFechaHora(
+      fecha,
+      hora
+    );
+
+    doc["fecha"] = fecha;
+    doc["hora"] = hora;
+
+    String json;
+
+    serializeJsonPretty(
+      doc,
+      json
+    );
+
+    Serial.println();
+    Serial.println("JSON GENERADO:");
+    Serial.println(json);
+
+    // ==================================================
+    // PUBLICAR MQTT
+    // ==================================================
+
+    publicarMQTT(json);
+
+    Serial.println(
+      "===================================="
+    );
+  }
+
+  // ====================================================
+  // ESTADO BLUETOOTH
+  // ====================================================
+
+  if (
+    millis() - ultimaActividadBluetooth
+    > TIEMPO_BLUETOOTH_ACTIVO
+  ) {
+
+    bluetoothConectado = false;
+  }
+}
+
+// ======================================================
+// INDICADOR BLUETOOTH
+// ======================================================
+
+void actualizarBluetoothLED() {
+
+  // ====================================================
+  // BLUETOOTH CONECTADO
+  // ====================================================
+
+  if (bluetoothConectado) {
+
+    // Azul fijo
+    digitalWrite(LED_AZUL, HIGH);
+    
+
+    // Rojo APAGADO
+    digitalWrite(LED_ROJO, LOW);
+
+    return;
+  }
+
+  // ====================================================
+  // BLUETOOTH NO CONECTADO
+  // ====================================================
+
+  digitalWrite(LED_AZUL, LOW);
+
+  // Rojo fijo
+  digitalWrite(LED_ROJO, HIGH);
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println(
+    "========================================"
+  );
+
+  Serial.println(
+    " ESP32 + AT-09 + WIFI + MQTT + JSON"
+  );
+
+  Serial.println(
+    "              JIEDMAI"
+  );
+
+  Serial.println(
+    "========================================"
+  );
+
+  // ====================================================
+  // CONFIGURAR LEDS
+  // ====================================================
+
+  pinMode(
+    LED_VIOLETA,
+    OUTPUT
+  );
+
+  pinMode(
+    LED_VERDE,
+    OUTPUT
+  );
+
+  pinMode(
+    LED_AMARILLO,
+    OUTPUT
+  );
+
+  pinMode(
+    LED_NARANJA,
+    OUTPUT
+  );
+
+  pinMode(
+    LED_ROJO,
+    OUTPUT
+  );
+
+  pinMode(
+    LED_AZUL,
+    OUTPUT
+  );
+
+  pinMode(
+    LED_BLANCO,
+    OUTPUT
+  );
+
+  // Apagar todo
+  digitalWrite(LED_VIOLETA, LOW);
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_NARANJA, LOW);
+  digitalWrite(LED_ROJO, LOW);
+  digitalWrite(LED_AZUL, LOW);
+  digitalWrite(LED_BLANCO, LOW);
+
+  // ====================================================
+  // AT-09
+  // ====================================================
+
+  BluetoothSerial.begin(
+    9600,
+    SERIAL_8N1,
+    RX_AT09,
+    TX_AT09
+  );
+
+  Serial.println(
+    "AT-09 iniciado."
+  );
+
+  Serial.println(
+    "TX AT-09 -> GPIO 16"
+  );
+
+  Serial.println(
+    "RX AT-09 -> GPIO 17"
+  );
+
+  // ====================================================
+  // WIFI
+  // ====================================================
+
+  conectarWiFi();
+
+  // ====================================================
+  // HORA
+  // ====================================================
+
+  configTime(
+    -6 * 3600,
+    0,
+    "pool.ntp.org",
+    "time.nist.gov"
+  );
+
+  Serial.println(
+    "Sincronizando fecha y hora..."
+  );
+
+  delay(3000);
+
+  // ====================================================
+  // MQTT
+  // ====================================================
+
+  client.setServer(
+    mqtt_server,
+    mqtt_port
+  );
+
+  client.setCallback(callback);
+
+  conectarMQTT();
+
+  // ====================================================
+  // SISTEMA LISTO
+  // ====================================================
+
+  Serial.println();
+  Serial.println(
+    "========================================"
+  );
+
+  Serial.println(
+    "             SISTEMA LISTO"
+  );
+
+  Serial.println(
+    "========================================"
+  );
+
+  Serial.print(
+    "Topic TX: "
+  );
+
+  Serial.println(topicTX);
+
+  Serial.print(
+    "Topic RX: "
+  );
+
+  Serial.println(topicRX);
+
+  Serial.println();
+  Serial.println(
+    "Bluetooth listo."
+  );
+
+  Serial.println(
+    "Esperando mensajes..."
+  );
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop() {
+
+  // ====================================================
+  // WIFI
+  // ====================================================
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    wifiConectado = false;
+
+    digitalWrite(
+      LED_BLANCO,
+      LOW
+    );
+
+    conectarWiFi();
+  }
+  else {
+
+    wifiConectado = true;
+
+    // Blanco fijo
+    digitalWrite(
+      LED_BLANCO,
+      HIGH
+    );
+  }
+
+  // ====================================================
+  // MQTT
+  // ====================================================
+
+  if (!client.connected()) {
+
+    conectarMQTT();
+  }
+
+  client.loop();
+
+  // ====================================================
+  // BLUETOOTH
+  // ====================================================
+
+  revisarBluetooth();
+
+  actualizarBluetoothLED();
+}
